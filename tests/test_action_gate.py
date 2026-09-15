@@ -136,7 +136,7 @@ def test_sanitize_correlates_with_decision(tmp_path):
     s = g.sanitize("email a@b.com", resource="statement.pdf", decision_id=decision["decision_id"])
     assert s["report"]["decision_id"] == decision["decision_id"]
     lines = [json.loads(l) for l in (tmp_path / "audit.jsonl").read_text().splitlines()]
-    auth_line = next(l for l in lines if l.get("decision") == "Allow" and "event" not in l)
+    auth_line = next(l for l in lines if l.get("decision") == "Allow" and l.get("event") == "decision")
     san_line = next(l for l in lines if l.get("event") == "sanitization")
     assert auth_line["decision_id"] == san_line["decision_id"] == decision["decision_id"]
     # existing sanitization fields are untouched; still value-free

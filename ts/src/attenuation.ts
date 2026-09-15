@@ -3,14 +3,16 @@
 // A Scope is a capability set that can spawn strictly-narrower child scopes. Any
 // dimension a child requests that the parent does not hold is denied by the real
 // engine strict-subset validator (@watchlight/engine), and every attenuation is
-// written to the value-free audit trail. The Developer Edition governs the tree
-// up to DE_MAX_DEPTH; Enterprise removes the cap and enforces it server-side.
+// written to the value-free audit trail. Every tree is bounded by its
+// maxDelegationDepth — a governance control (default 8); a hop past it is a deny
+// with reason code DELEGATION_DEPTH_EXCEEDED.
 
 import * as crypto from "node:crypto";
 import type { Engine, GrantedScope, RequestedScope } from "@watchlight/engine";
 import * as path from "node:path";
 import { AuditTrail, type AttenuationRecord, type WritableAuditRecord } from "./audit";
 import {
+  MAX_CHAIN_LENGTH,
   ScopeTokenError,
   nowSeconds,
   signingSecret,
@@ -20,26 +22,12 @@ import {
   type ScopeTokenClaims,
 } from "./scope-token";
 
-/** Developer-Edition sub-agent tree depth ceiling. */
-export const DE_MAX_DEPTH = 5;
+/** Default `maxDelegationDepth`: how many attenuation hops a sub-agent tree may go
+ *  below its root (depth 0). A governance control, not an edition limit. */
+export const DEFAULT_MAX_DELEGATION_DEPTH = 8;
 
-const CEILING_NOTICE = (cap: number, depth: number) =>
-  `Developer Edition governs sub-agent trees up to depth ${cap}; ` +
-  `requested depth ${depth}. Enterprise removes this cap and enforces it server-side.`;
-
-/** Raised at the Developer-Edition depth ceiling. NOT a policy denial — a
- *  product boundary. Every attenuation up to the cap was a real, engine-validated
- *  strict subset. */
-export class DevEditionCeiling extends Error {
-  readonly depth: number;
-  readonly cap: number;
-  constructor(depth: number) {
-    super(CEILING_NOTICE(DE_MAX_DEPTH, depth));
-    this.name = "DevEditionCeiling";
-    this.depth = depth;
-    this.cap = DE_MAX_DEPTH;
-  }
-}
+/** Reason code on a refused attenuation that would exceed `maxDelegationDepth`. */
+export const DELEGATION_DEPTH_EXCEEDED = "DELEGATION_DEPTH_EXCEEDED" as const;
 
 /** Raised when a requested child scope is not a strict subset of its parent. */
 export class AttenuationDenied extends Error {
@@ -53,10 +41,116 @@ export class AttenuationDenied extends Error {
   }
 }
 
+/** Thrown when an attenuation would take a sub-agent tree deeper than its
+ *  `maxDelegationDepth`. A deny like any other refused attenuation — the child is
+ *  never created — with a distinct {@link code} so it can be told apart from a
+ *  scope that is not a strict subset. `depth` is the depth the refused child
+ *  would have had; `limit` is the limit it exceeded. */
+export class DelegationDepthExceeded extends AttenuationDenied {
+  readonly code: typeof DELEGATION_DEPTH_EXCEEDED = DELEGATION_DEPTH_EXCEEDED;
+  readonly depth: number;
+  readonly limit: number;
+  constructor(depth: number, limit: number) {
+    super(["MaxDepth"], `delegation depth ${depth} exceeds max_delegation_depth ${limit}`);
+    this.name = "DelegationDepthExceeded";
+    this.depth = depth;
+    this.limit = limit;
+  }
+}
+
 const norm = (x?: readonly string[] | null): string[] => (x ? [...x] : []);
 /** Fixed message for a spent scope (never carries scope or token details). */
 const EXPIRED_SCOPE = "scope has expired";
 const nodeId = (): string => crypto.randomBytes(4).toString("hex");
+
+/** An attenuation record's `resource`: the sub-agent the scope is for, when one
+ *  is named, else the depth. */
+const scopeLabel = (depth: number, agent?: string): string =>
+  agent ? `scope for ${agent}` : `sub-agent depth ${depth}`;
+
+/** The dimensions an attenuation is checked against — a {@link Scope}'s or a
+ *  {@link ScopePreview}'s. */
+interface ScopeDims {
+  readonly allowedTools: readonly string[];
+  readonly allowedResources: readonly string[];
+  readonly allowedIntents: readonly string[];
+  readonly maxDepth: number;
+  readonly timeBudgetSeconds: number;
+  readonly depth: number;
+  readonly maxDelegationDepth: number;
+}
+
+type AttenuationOutcome =
+  | { kind: "depth"; requestedTools: string[]; childDepth: number }
+  | { kind: "deny"; requestedTools: string[]; childDepth: number; violations: string[]; reason: string }
+  | {
+      kind: "allow";
+      childDepth: number;
+      grant: {
+        allowedTools: string[];
+        allowedResources: string[];
+        allowedIntents: string[];
+        maxDepth: number;
+        timeBudgetSeconds: number;
+        depth: number;
+      };
+    };
+
+/** Run the engine's strict-subset check for a child of `p`. Creates and records
+ *  nothing: the one decision both {@link Scope.attenuate} and the previews act
+ *  on, so the two cannot disagree. */
+function attenuationOutcome(engine: Engine, p: ScopeDims, opts: AttenuateOptions): AttenuationOutcome {
+  const childDepth = p.depth + 1;
+  const requestedTools = opts.tools !== undefined ? norm(opts.tools) : [...p.allowedTools];
+
+  // maxDelegationDepth — a governance control, checked before the engine.
+  if (childDepth > p.maxDelegationDepth) return { kind: "depth", requestedTools, childDepth };
+
+  const parent: GrantedScope = {
+    allowed_tools: [...p.allowedTools],
+    allowed_resources: p.allowedResources.map((matcher) => ({ matcher })),
+    allowed_intents: [...p.allowedIntents],
+    max_depth: p.maxDepth,
+    time_budget_seconds: p.timeBudgetSeconds,
+    depth: p.depth,
+  };
+  const request: RequestedScope = {
+    allowed_tools: requestedTools,
+    allowed_resources: (opts.resources !== undefined ? norm(opts.resources) : [...p.allowedResources]).map(
+      (matcher) => ({ matcher })
+    ),
+    allowed_intents: opts.intents !== undefined ? norm(opts.intents) : [...p.allowedIntents],
+    max_depth: Math.max(0, p.maxDepth - 1),
+    time_budget_seconds: opts.timeBudgetSeconds !== undefined ? opts.timeBudgetSeconds : p.timeBudgetSeconds,
+  };
+
+  const resp = engine.attenuateScope(parent, request);
+  if (resp.decision !== "Allow") {
+    const violations = "violations" in resp ? resp.violations : [];
+    // The engine's own depth budget is spent — the same deny.
+    if (violations.includes("MaxDepth") && p.maxDepth <= 0) return { kind: "depth", requestedTools, childDepth };
+    const reason =
+      ("reason" in resp && resp.reason) || "requested scope is not a strict subset of the parent";
+    return { kind: "deny", requestedTools, childDepth, violations, reason };
+  }
+
+  // The engine returns the CLAMPED grant — never the child's raw request.
+  const granted = resp.granted_scope;
+  return {
+    kind: "allow",
+    childDepth,
+    grant: {
+      allowedTools: granted.allowed_tools ?? request.allowed_tools,
+      allowedResources: (granted.allowed_resources ?? request.allowed_resources).map((r) =>
+        typeof r === "string" ? r : r.matcher
+      ),
+      allowedIntents: granted.allowed_intents ?? request.allowed_intents,
+      maxDepth: granted.max_depth ?? request.max_depth,
+      timeBudgetSeconds: granted.time_budget_seconds ?? request.time_budget_seconds,
+      depth: granted.depth ?? childDepth,
+    },
+  };
+}
 
 export interface AttenuateOptions {
   tools?: readonly string[];
@@ -99,6 +193,10 @@ interface ScopeInit {
   /** The ordered actor chain, root first, that a call made through this scope
    *  carries. Defaults to `[agent]` for a root. */
   actorChain?: readonly string[];
+  /** The deepest any scope in this tree may be (the root is depth 0). Set on the
+   *  root from the governor's `maxDelegationDepth`; children inherit it.
+   *  Defaults to `depth + maxDepth`. */
+  maxDelegationDepth?: number;
 }
 
 /** Options for {@link Scope.toToken}. */
@@ -126,8 +224,11 @@ export class Scope {
    *  by a flight-booker. The last entry is the acting (leaf) agent. A root
    *  scope's chain is just the governor's agent; each {@link attenuate} that
    *  names an `agent` appends one entry, so the chain is at most
-   *  `DE_MAX_DEPTH + 1` long. */
+   *  `maxDelegationDepth + 1` long. */
   readonly actorChain: readonly string[];
+  /** The deepest any scope in this tree may be (the root is depth 0) — the
+   *  governor's `maxDelegationDepth`, or lower when the root scope set one. */
+  readonly maxDelegationDepth: number;
   /** Epoch seconds this scope came into force. */
   readonly issuedAt: number;
   private _expiresAt: number;
@@ -147,6 +248,8 @@ export class Scope {
     this.maxDepth = init.maxDepth;
     this.timeBudgetSeconds = init.timeBudgetSeconds;
     this.depth = init.depth;
+    // Never past the structural bound, however the scope was constructed.
+    this.maxDelegationDepth = Math.min(init.maxDelegationDepth ?? init.depth + init.maxDepth, MAX_CHAIN_LENGTH);
     this.nodeId = nodeId();
     this.parentId = init.parentId;
     this.actorChain = Object.freeze([...(init.actorChain ?? [init.agent])]);
@@ -235,95 +338,91 @@ export class Scope {
   /**
    * Derive a sub-agent scope — a strict subset of this one. Any dimension you
    * omit inherits the parent's (and the engine clamps it regardless). Throws
-   * {@link AttenuationDenied} if the request exceeds the parent, and
-   * {@link DevEditionCeiling} at the Developer-Edition depth ceiling.
+   * {@link AttenuationDenied} if the request exceeds the parent — or
+   * {@link DelegationDepthExceeded}, a subclass, when the child would be deeper
+   * than {@link maxDelegationDepth}.
    */
   attenuate(opts: AttenuateOptions = {}): Scope {
     this.assertActive(); // a spent scope grants nothing further (fail-closed)
-    const childDepth = this.depth + 1;
-    const requestedTools = opts.tools !== undefined ? norm(opts.tools) : this.allowedTools;
-
-    // Developer-Edition ceiling — a product boundary, checked before the engine.
-    if (childDepth > DE_MAX_DEPTH) {
+    // A named sub-agent's records carry the chain it would act under.
+    const named = opts.agent ? [...this.actorChain, opts.agent] : undefined;
+    const out = attenuationOutcome(this._engine, this, opts);
+    // A hop past maxDelegationDepth is a deny: the child is never created.
+    if (out.kind === "depth") return this._denyDepth(out.requestedTools, out.childDepth, opts.agent);
+    if (out.kind === "deny") {
       this._record({
         nodeId: nodeId(),
         parentId: this.nodeId,
-        tools: requestedTools,
-        resource: `sub-agent depth ${childDepth}`,
+        tools: out.requestedTools,
+        resource: scopeLabel(out.childDepth, opts.agent),
         decision: "Deny",
-        depth: childDepth,
-        reason: CEILING_NOTICE(DE_MAX_DEPTH, childDepth),
+        depth: out.childDepth,
+        reason: out.reason,
+        actorChain: named,
       });
-      throw new DevEditionCeiling(childDepth);
+      throw new AttenuationDenied(out.violations, out.reason);
     }
 
-    const parent: GrantedScope = {
-      allowed_tools: this.allowedTools,
-      allowed_resources: this.allowedResources.map((matcher) => ({ matcher })),
-      allowed_intents: this.allowedIntents,
-      max_depth: this.maxDepth,
-      time_budget_seconds: this.timeBudgetSeconds,
-      depth: this.depth,
-    };
-    const request: RequestedScope = {
-      allowed_tools: requestedTools,
-      allowed_resources: (opts.resources !== undefined ? norm(opts.resources) : this.allowedResources).map(
-        (matcher) => ({ matcher })
-      ),
-      allowed_intents: opts.intents !== undefined ? norm(opts.intents) : this.allowedIntents,
-      max_depth: Math.max(0, this.maxDepth - 1),
-      time_budget_seconds:
-        opts.timeBudgetSeconds !== undefined ? opts.timeBudgetSeconds : this.timeBudgetSeconds,
-    };
-
-    const resp = this._engine.attenuateScope(parent, request);
-    if (resp.decision !== "Allow") {
-      const violations = "violations" in resp ? resp.violations : [];
-      const reason =
-        ("reason" in resp && resp.reason) || "requested scope is not a strict subset of the parent";
-      this._record({
-        nodeId: nodeId(),
-        parentId: this.nodeId,
-        tools: requestedTools,
-        resource: `sub-agent depth ${childDepth}`,
-        decision: "Deny",
-        depth: childDepth,
-        reason,
-      });
-      throw new AttenuationDenied(violations, reason);
-    }
-
-    // The engine returns the CLAMPED grant — never the child's raw request.
-    const granted = resp.granted_scope;
-    const grantedResources = (granted.allowed_resources ?? request.allowed_resources).map((r) =>
-      typeof r === "string" ? r : r.matcher
-    );
+    const g = out.grant;
     const child = new Scope({
       engine: this._engine,
       audit: this._audit,
       agent: this.agent,
-      allowedTools: granted.allowed_tools ?? request.allowed_tools,
-      allowedResources: grantedResources,
-      allowedIntents: granted.allowed_intents ?? request.allowed_intents,
-      maxDepth: granted.max_depth ?? request.max_depth,
-      timeBudgetSeconds: granted.time_budget_seconds ?? request.time_budget_seconds,
-      depth: granted.depth ?? childDepth,
+      allowedTools: g.allowedTools,
+      allowedResources: g.allowedResources,
+      allowedIntents: g.allowedIntents,
+      maxDepth: g.maxDepth,
+      timeBudgetSeconds: g.timeBudgetSeconds,
+      depth: g.depth,
+      maxDelegationDepth: this.maxDelegationDepth,
       parentId: this.nodeId,
       parent: this,
       signingSecrets: this._signingSecrets,
       // Naming the sub-agent this scope is spawned for extends the delegation
       // chain; narrowing without a name leaves the acting identity unchanged.
-      actorChain: opts.agent ? [...this.actorChain, opts.agent] : this.actorChain,
+      actorChain: named ?? this.actorChain,
     });
     this._record({
       nodeId: child.nodeId,
       parentId: this.nodeId,
       tools: child.allowedTools,
-      resource: `sub-agent depth ${child.depth}`,
+      resource: scopeLabel(child.depth, opts.agent),
       decision: "Allow",
       depth: child.depth,
+      actorChain: named,
     });
     return child;
+  }
+
+  /**
+   * What {@link attenuate} would grant, without granting it or recording
+   * anything — for showing a sub-agent's effective authority. Runs the same
+   * engine check and returns a {@link ScopePreview}: the clamped grant, or the
+   * violations and reason it would be refused with. A preview is data, never a
+   * scope: it cannot authorize, delegate, or mint a token.
+   */
+  previewAttenuate(opts: AttenuateOptions = {}): ScopePreview {
+    this.assertActive();
+    return previewChild(this._engine, this, this.actorChain, opts);
+  }
+
+  /** Refuse a hop past {@link maxDelegationDepth}: record the deny — the observed
+   *  depth and the limit — then throw. The child is never created. */
+  private _denyDepth(requestedTools: readonly string[], childDepth: number, agent?: string): never {
+    const err = new DelegationDepthExceeded(childDepth, this.maxDelegationDepth);
+    this._record({
+      nodeId: nodeId(),
+      parentId: this.nodeId,
+      tools: requestedTools,
+      resource: scopeLabel(childDepth, agent),
+      decision: "Deny",
+      depth: childDepth,
+      reason: err.reason,
+      reasonCode: DELEGATION_DEPTH_EXCEEDED,
+      maxDelegationDepth: this.maxDelegationDepth,
+      actorChain: agent ? [...this.actorChain, agent] : undefined,
+    });
+    throw err;
   }
 
   /** Record this scope as the root of an attenuation tree (parent-less). */
@@ -346,6 +445,9 @@ export class Scope {
     decision: AttenuationRecord["decision"];
     depth: number;
     reason?: string;
+    reasonCode?: typeof DELEGATION_DEPTH_EXCEEDED;
+    maxDelegationDepth?: number;
+    actorChain?: readonly string[];
   }): void {
     // Value-free by construction — a scope's dimensions are capability NAMES,
     // never argument values. Shape matches Python's audit tree records.
@@ -362,7 +464,161 @@ export class Scope {
     };
     if (r.parentId) record.parent_id = r.parentId;
     if (r.reason) record.reason = r.reason;
+    if (r.reasonCode) record.reason_code = r.reasonCode;
+    if (r.maxDelegationDepth !== undefined) record.max_delegation_depth = r.maxDelegationDepth;
+    // The named sub-agent the scope is for, and the chain it acts under.
+    if (r.actorChain && r.actorChain.length) record.actor_chain = [...r.actorChain];
     // One funnel: the governor's file + optional sink (see ./audit.ts).
     this._audit.write(record);
   }
+}
+
+interface ScopePreviewInit {
+  engine: Engine;
+  allowed: boolean;
+  allowedTools: readonly string[];
+  allowedResources: readonly string[];
+  allowedIntents: readonly string[];
+  maxDepth: number;
+  timeBudgetSeconds: number;
+  depth: number;
+  maxDelegationDepth: number;
+  actorChain: readonly string[];
+  violations?: readonly string[];
+  reason?: string;
+  reasonCode?: typeof DELEGATION_DEPTH_EXCEEDED;
+}
+
+/**
+ * What a scope would be granted — the engine's answer, as data, with nothing
+ * recorded.
+ *
+ * Returned by {@link Watchlight.previewScope} and {@link Scope.previewAttenuate},
+ * for showing an agent's effective authority without writing to the audit
+ * trail. It runs the same engine strict-subset check as {@link Scope.attenuate},
+ * but it is not a grant: it has no `attenuate`, cannot authorize, delegate or
+ * mint a token, and nothing is recorded. {@link previewAttenuate} previews the
+ * next level down.
+ *
+ * `allowed` says whether the scope would be granted. When it would not,
+ * `violations` and `reason` say why (`reasonCode` is `DELEGATION_DEPTH_EXCEEDED`
+ * for a hop past the depth limit) and `allowedTools` is the requested set.
+ */
+export class ScopePreview {
+  readonly allowed: boolean;
+  readonly allowedTools: readonly string[];
+  readonly allowedResources: readonly string[];
+  readonly allowedIntents: readonly string[];
+  readonly maxDepth: number;
+  readonly timeBudgetSeconds: number;
+  readonly depth: number;
+  readonly maxDelegationDepth: number;
+  readonly actorChain: readonly string[];
+  readonly violations: readonly string[];
+  readonly reason: string;
+  readonly reasonCode?: typeof DELEGATION_DEPTH_EXCEEDED;
+  private readonly _engine: Engine;
+
+  /** @internal Built by {@link Watchlight.previewScope} and the previews. */
+  constructor(init: ScopePreviewInit) {
+    this._engine = init.engine;
+    this.allowed = init.allowed;
+    this.allowedTools = Object.freeze(norm(init.allowedTools));
+    this.allowedResources = Object.freeze(norm(init.allowedResources));
+    this.allowedIntents = Object.freeze(norm(init.allowedIntents));
+    this.maxDepth = init.maxDepth;
+    this.timeBudgetSeconds = init.timeBudgetSeconds;
+    this.depth = init.depth;
+    this.maxDelegationDepth = Math.min(init.maxDelegationDepth, MAX_CHAIN_LENGTH);
+    this.actorChain = Object.freeze([...init.actorChain]);
+    this.violations = Object.freeze([...(init.violations ?? [])]);
+    this.reason = init.reason ?? "";
+    this.reasonCode = init.reasonCode;
+  }
+
+  /** Preview the next level down, exactly as {@link Scope.attenuate} would
+   *  decide it. Below a preview that would be refused, nothing would be granted
+   *  either. */
+  previewAttenuate(opts: AttenuateOptions = {}): ScopePreview {
+    if (!this.allowed) {
+      return new ScopePreview({
+        engine: this._engine,
+        allowed: false,
+        allowedTools: opts.tools !== undefined ? norm(opts.tools) : this.allowedTools,
+        allowedResources: [],
+        allowedIntents: [],
+        maxDepth: 0,
+        timeBudgetSeconds: 0,
+        depth: this.depth + 1,
+        maxDelegationDepth: this.maxDelegationDepth,
+        actorChain: opts.agent ? [...this.actorChain, opts.agent] : this.actorChain,
+        violations: this.violations,
+        reason: "its parent scope would not be granted",
+        reasonCode: this.reasonCode,
+      });
+    }
+    return previewChild(this._engine, this, this.actorChain, opts);
+  }
+
+  /** The preview as plain data — what `JSON.stringify` writes. */
+  toJSON(): Record<string, unknown> {
+    const out: Record<string, unknown> = {
+      allowed: this.allowed,
+      tools: [...this.allowedTools],
+      resources: [...this.allowedResources],
+      intents: [...this.allowedIntents],
+      depth: this.depth,
+      max_depth: this.maxDepth,
+      time_budget_seconds: this.timeBudgetSeconds,
+      actor_chain: [...this.actorChain],
+    };
+    if (!this.allowed) {
+      out.violations = [...this.violations];
+      out.reason = this.reason;
+      if (this.reasonCode) out.reason_code = this.reasonCode;
+    }
+    return out;
+  }
+}
+
+/** The {@link ScopePreview} of a child of `p` — nothing recorded. */
+function previewChild(
+  engine: Engine,
+  p: ScopeDims,
+  chain: readonly string[],
+  opts: AttenuateOptions
+): ScopePreview {
+  const out = attenuationOutcome(engine, p, opts);
+  const actorChain = opts.agent ? [...chain, opts.agent] : chain;
+  if (out.kind === "allow") {
+    const g = out.grant;
+    return new ScopePreview({
+      engine,
+      allowed: true,
+      allowedTools: g.allowedTools,
+      allowedResources: g.allowedResources,
+      allowedIntents: g.allowedIntents,
+      maxDepth: g.maxDepth,
+      timeBudgetSeconds: g.timeBudgetSeconds,
+      depth: g.depth,
+      maxDelegationDepth: p.maxDelegationDepth,
+      actorChain,
+    });
+  }
+  const depthErr = out.kind === "depth" ? new DelegationDepthExceeded(out.childDepth, p.maxDelegationDepth) : undefined;
+  return new ScopePreview({
+    engine,
+    allowed: false,
+    allowedTools: out.requestedTools,
+    allowedResources: [],
+    allowedIntents: [],
+    maxDepth: 0,
+    timeBudgetSeconds: 0,
+    depth: out.childDepth,
+    maxDelegationDepth: p.maxDelegationDepth,
+    actorChain,
+    violations: depthErr ? depthErr.violations : out.kind === "deny" ? out.violations : [],
+    reason: depthErr ? depthErr.reason : out.kind === "deny" ? out.reason : "",
+    reasonCode: depthErr ? DELEGATION_DEPTH_EXCEEDED : undefined,
+  });
 }

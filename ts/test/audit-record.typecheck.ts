@@ -27,6 +27,7 @@ const rows: string[] = [];
 
 const typedSink: AuditSink = (r: AuditRecord) => {
   switch (r.event) {
+    case "decision":
     case undefined:
       rows.push(`decision ${r.principal} ${r.decision} ${r.decision_id ?? "-"} ${r.approved === true}`);
       return;
@@ -56,8 +57,9 @@ const summarize = (r: AuditRecord): string => `${r.ts} ${r.agent} ${r.intent} ${
 const commonOnly = (r: AuditRecordBase): string => `${r.ts} ${r.agent} ${r.intent} ${r.resource}`;
 const base = (r: AuditRecord): string => commonOnly(r);
 
-// `"event" in r` narrows too — the same test `countAuditRecords` makes.
-const isDecision = (r: AuditRecord): r is DecisionRecord => !("event" in r);
+// A decision: `event` is "decision", or absent on a record from an earlier
+// release — the same test `countAuditRecords` makes.
+const isDecision = (r: AuditRecord): r is DecisionRecord => r.event === "decision" || r.event === undefined;
 
 // ── 2. the escape hatch: an untyped sink still satisfies AuditSink ──
 // This is the pre-union signature, unchanged, and it still compiles.
@@ -145,6 +147,7 @@ const egressFields: Record<keyof EgressRecord, true> = {
 const attenuationFields: Record<keyof AttenuationRecord, true> = {
   ts: true, agent: true, intent: true, event: true, node_id: true, resource: true,
   decision: true, depth: true, tools: true, parent_id: true, reason: true,
+  reason_code: true, max_delegation_depth: true, actor_chain: true,
 };
 
 // The default governor takes a typed sink too.

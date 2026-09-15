@@ -16,7 +16,7 @@ import pytest
 
 pytest.importorskip("watchlight_engine")
 
-from watchlight import AttenuationDenied, DE_MAX_DEPTH, DevEditionCeiling, Watchlight
+from watchlight import AttenuationDenied, DelegationDepthExceeded, Watchlight
 from watchlight._audit import AuditTrail
 
 RESEARCH = 'permit(principal, action == Action::"research", resource);'
@@ -60,9 +60,9 @@ def _exercise(g):
     with pytest.raises(AttenuationDenied):
         root.attenuate(tools=["read", "delete"])
     s = child
-    for _ in range(child.depth, DE_MAX_DEPTH):
+    for _ in range(child.depth, g.max_delegation_depth):
         s = s.attenuate(tools=["read"])
-    with pytest.raises(DevEditionCeiling):
+    with pytest.raises(DelegationDepthExceeded):
         s.attenuate(tools=["read"])
     return [allow["decision"], deny["decision"], held["decision"], approved["decision"], approved["approved"]]
 
@@ -73,8 +73,8 @@ def test_every_record_kind_reaches_the_sink_with_identical_fields(tmp_path):
     _exercise(g)
     file = _lines(tmp_path)
     assert seen == file, "sink must see every file line, same order, same fields"
-    assert any("event" not in r and r["decision"] == "Allow" for r in seen)
-    assert any("event" not in r and r["decision"] == "Deny" for r in seen)
+    assert any(r.get("event") == "decision" and r["decision"] == "Allow" for r in seen)
+    assert any(r.get("event") == "decision" and r["decision"] == "Deny" for r in seen)
     assert any(r["decision"] == "NeedsApproval" for r in seen)
     assert any(r.get("approved") is True and r["decision"] == "Allow" for r in seen)
     assert any(r.get("event") == "sanitization" and r["counts"]["EMAIL"] == 1 for r in seen)

@@ -26,8 +26,8 @@ never argument values, never text, never secrets. In TypeScript the copy is
 frozen, and in both lanes the file is written first, so nothing the sink does can
 alter it.
 
-Records come in five kinds, discriminated by `event`: a **decision** (no `event`
-at all), a **`sanitization`**, a **`screening`**, an **`egress`** and an
+Records come in five kinds, discriminated by `event`: a **decision**
+(`"decision"`, or no `event` on one written by an earlier release), a **`sanitization`**, a **`screening`**, an **`egress`** and an
 **`attenuation`**. A record from a `delegate()`d governor also carries
 `actor_chain`. The kinds are types — a TypeScript discriminated union, Python
 `TypedDict`s of the same names — so renaming a field breaks a sink at build time

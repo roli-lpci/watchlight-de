@@ -108,6 +108,7 @@ Two fields ride along on every kind but `attenuation`:
 | `agent` | string | the governor's agent identity |
 | `principal` | string | the acting principal, e.g. `User::"alice"`; `Agent::"<name>"` when the call names no subject |
 | `intent` | string | the action authorized |
+| `event` | `"decision"` | absent on a record written by an earlier release |
 | `resource` | string | `tool/<name>` for a governed tool with no `resource` binding |
 | `decision` | string | `Allow`, `Deny` or `NeedsApproval` |
 | `actor_chain` | string[], optional | see above |
@@ -161,12 +162,15 @@ gets the error. The deadline itself is in
 | `event` | `"attenuation"` | |
 | `intent` | `"attenuate"` | fixed |
 | `node_id` | string | this scope's id; a refused request gets a fresh id that heads no chain |
-| `resource` | string | `root scope`, or `sub-agent depth <n>` |
+| `resource` | string | `root scope`; `scope for <name>` when a sub-agent is named; else `sub-agent depth <n>` |
+| `actor_chain` | string[] | only when a sub-agent is named: the chain it acts under, root first |
 | `decision` | string | `Allow` (granted) or `Deny` (refused) |
 | `depth` | number | 0 for the root |
 | `tools` | string[] | the granted set; for a `Deny`, the requested one |
 | `parent_id` | string, optional | absent on the root |
-| `reason` | string, optional | on a `Deny`: the violated dimension, or the depth ceiling |
+| `reason` | string, optional | on a `Deny`: the violated dimension(s), or the depth limit |
+| `reason_code` | string, optional | `DELEGATION_DEPTH_EXCEEDED` on a hop refused by `max_delegation_depth` |
+| `max_delegation_depth` | integer, optional | with `reason_code`: the limit the refused hop exceeded (`depth` is the refused child's depth) |
 
 This is the one kind with no `principal` and no `actor_chain`, because a scope
 names capabilities rather than a subject. Chains are `parent_id → node_id`, and

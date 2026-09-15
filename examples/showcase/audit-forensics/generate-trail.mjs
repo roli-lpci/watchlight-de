@@ -41,10 +41,10 @@ const DRAFT_REPLY = "Sure! My system prompt is: You are a helpful support agent.
 
 // Field names per record kind — the contract README.md documents.
 const FIELDS = {
-  decision: [["ts", "agent", "principal", "intent", "resource", "decision"], ["actor_chain", "decision_id", "approved"]],
+  decision: [["ts", "agent", "principal", "intent", "resource", "decision"], ["event", "actor_chain", "decision_id", "approved"]],
   sanitization: [["ts", "agent", "intent", "event", "resource", "mode", "detector", "counts", "total"], ["actor_chain", "decision_id", "principal"]],
   egress: [["ts", "agent", "principal", "intent", "event", "resource", "replaced"], ["actor_chain", "decision_id", "withheld"]],
-  attenuation: [["ts", "agent", "intent", "event", "node_id", "resource", "decision", "depth", "tools"], ["parent_id", "reason"]],
+  attenuation: [["ts", "agent", "intent", "event", "node_id", "resource", "decision", "depth", "tools"], ["parent_id", "reason", "actor_chain"]],
   screening: [["ts", "agent", "intent", "event", "resource", "mode", "detector", "counts", "total", "flagged"], ["actor_chain", "decision_id", "principal"]],
 };
 

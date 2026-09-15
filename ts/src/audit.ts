@@ -58,19 +58,18 @@ export type AuditRecordBase = {
 
 /** The ordered delegation chain, root first — present ONLY on a record written
  *  through a `delegate()`d governor, whose chain is longer than one name. A
- *  call outside any delegation carries no `actor_chain` at all. Never written
- *  on an `attenuation` record. */
+ *  call outside any delegation carries no `actor_chain` at all. */
 type ActorChain = { readonly actor_chain?: readonly string[] };
 
 /** A governance decision — written by `authorize()`, and so by every governed
- *  tool call. The ONLY kind with no `event` field: that absence is the
- *  discriminant. An approved action is two records — the `NeedsApproval` hold,
+ *  tool call. Its `event` is `"decision"`; one written by an earlier release has
+ *  no `event` at all, so read a missing `event` as a decision too. An approved action is two records — the `NeedsApproval` hold,
  *  then an `Allow` carrying `approved: true` under a new `decision_id`. The
  *  reason is never written; callers see a uniform, non-revealing one. */
 export type DecisionRecord = AuditRecordBase &
   ActorChain & {
-    /** Absent on a decision record. Present, and a literal, on every other kind. */
-    readonly event?: undefined;
+    /** `"decision"`. Absent on a record written by an earlier release. */
+    readonly event?: "decision";
     /** The acting principal, e.g. `User::"alice"`; defaults to `Agent::"<agent>"`. */
     readonly principal: string;
     readonly decision: "Allow" | "Deny" | "NeedsApproval";
@@ -139,7 +138,7 @@ export type EgressRecord = AuditRecordBase &
 
 /** One node of a sub-agent scope tree — written by `scope()` for the root and
  *  by every `attenuate()`, granted or refused. Carries capability NAMES only.
- *  Unlike the other kinds it has no `principal` and no `actor_chain`. */
+ *  Unlike the other kinds it has no `principal`. */
 export type AttenuationRecord = AuditRecordBase & {
   readonly event: "attenuation";
   /** Always the fixed word `attenuate`. */
@@ -154,8 +153,17 @@ export type AttenuationRecord = AuditRecordBase & {
   readonly tools: readonly string[];
   /** Absent on the root. */
   readonly parent_id?: string;
-  /** Present on a `Deny`: the violated dimension, or the depth-ceiling notice. */
+  /** Present on a `Deny`: the violated dimension(s), or the depth limit. */
   readonly reason?: string;
+  /** Present on a `Deny` from `maxDelegationDepth`: `DELEGATION_DEPTH_EXCEEDED`.
+   *  `depth` is the refused child's depth. */
+  readonly reason_code?: "DELEGATION_DEPTH_EXCEEDED";
+  /** Present with `reason_code`: the limit the refused hop exceeded. */
+  readonly max_delegation_depth?: number;
+  /** Present when the scope was granted — or refused — FOR a named sub-agent
+   *  (`attenuate({ agent })`, `delegate()`): the chain that sub-agent acts
+   *  under, root first. `resource` then reads `scope for <name>`. */
+  readonly actor_chain?: readonly string[];
 };
 
 /**
@@ -171,6 +179,7 @@ export type AttenuationRecord = AuditRecordBase & {
  * ```ts
  * const sink: AuditSink = (r) => {
  *   switch (r.event) {
+ *     case "decision":
  *     case undefined:      return store.decision(r.principal, r.decision, r.decision_id);
  *     case "sanitization": return store.redaction(r.counts, r.total);
  *     case "screening":    return store.screening(r.counts, r.flagged);

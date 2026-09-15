@@ -91,7 +91,15 @@ from ._counters import (
     count_from_source_async,
     parse_window_seconds,
 )
-from .attenuation import DE_MAX_DEPTH, AttenuationDenied, DevEditionCeiling, Scope
+from .attenuation import (
+    DEFAULT_MAX_DELEGATION_DEPTH,
+    DELEGATION_DEPTH_EXCEEDED,
+    AttenuationDenied,
+    DelegationDepthExceeded,
+    Scope,
+    ScopePreview,
+)
+from .scope_token import MAX_CHAIN_LENGTH as _DEPTH_BOUND
 from .policytest import load_test_suite, run_policy_tests
 from .scope_token import (
     ScopeTokenError,
@@ -174,10 +182,12 @@ __all__ = [
     "ScreenError",
     "govern",
     "Scope",
+    "ScopePreview",
     "AttenuationDenied",
-    "DevEditionCeiling",
+    "DelegationDepthExceeded",
     "ScopeTokenError",
-    "DE_MAX_DEPTH",
+    "DEFAULT_MAX_DELEGATION_DEPTH",
+    "DELEGATION_DEPTH_EXCEEDED",
     "run_policy_tests",
     "load_test_suite",
 ]
@@ -301,8 +311,20 @@ ACTOR_CONTEXT_KEY = "actor"
 ACTOR_CHAIN_CONTEXT_KEY = "actor_chain"
 
 #: The longest an actor chain can be: the root agent plus one entry per
-#: attenuation level, bounded by the Developer-Edition depth ceiling.
-MAX_ACTOR_CHAIN = DE_MAX_DEPTH + 1
+#: attenuation level. A governor's chains are bounded by its
+#: ``max_delegation_depth`` + 1; this is that bound for the largest value the
+#: setting accepts.
+MAX_ACTOR_CHAIN = _DEPTH_BOUND + 1
+
+
+def _check_max_delegation_depth(value: Any) -> int:
+    """``max_delegation_depth`` is a whole number from 0 (no sub-agents) to
+    :data:`~watchlight.scope_token.MAX_CHAIN_LENGTH`."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("max_delegation_depth must be an int")
+    if not 0 <= value <= _DEPTH_BOUND:
+        raise ValueError(f"max_delegation_depth must be between 0 and {_DEPTH_BOUND}, got {value}")
+    return value
 
 #: Fixed, value-free message of :class:`AuthorizeRequestError`.
 REQUEST_INVALID_MESSAGE = (
@@ -426,6 +448,7 @@ class _GovernorState:
         "announced",
         "sources",
         "strict_principal",
+        "max_delegation_depth",
         "audit_options",
         "audit_env_applied",
         "is_default",
@@ -455,6 +478,9 @@ class _GovernorState:
         #: Resolved sources already loaded — the key of ``load()``'s idempotence.
         self.sources: set[str] = set()
         self.strict_principal = True
+        #: The sub-agent depth limit — shared, so every name of one governor
+        #: attenuates under the same governance control.
+        self.max_delegation_depth = DEFAULT_MAX_DELEGATION_DEPTH
         #: The audit options in force, so ``_configure`` can apply one of them
         #: without dropping the others.
         self.audit_options: dict[str, Any] = {}
@@ -2154,6 +2180,7 @@ class Watchlight:
         audit_sink_batch: Optional[int] = None,
         audit_sink_interval: Optional[float] = None,
         strict_principal: bool = True,
+        max_delegation_depth: Optional[int] = None,
     ) -> None:
         """:param agent: stable agent identity for the audit trail and the
             reserved ``context.actor`` key. Falls back to ``$WATCHLIGHT_AGENT``
@@ -2248,6 +2275,13 @@ class Watchlight:
             once. Every governor pointed at the same directory — concurrent
             instances in one process included — appends to the same file, so
             those records interleave and are told apart only by their fields.
+        :param max_delegation_depth: how many attenuation hops a sub-agent tree
+            may go below its root (depth 0) — a governance control, like a
+            privilege-escalation depth limit in traditional IAM. Defaults to
+            :data:`DEFAULT_MAX_DELEGATION_DEPTH` (8); ``0`` allows no sub-agents.
+            A hop past it is a deny (:class:`DelegationDepthExceeded`, reason code
+            :data:`DELEGATION_DEPTH_EXCEEDED`), written to the audit trail with
+            the observed depth and the limit. :meth:`scope` can lower it per tree.
         :param strict_principal: how a call that names no ``principal`` is
             recorded (default ``True``): the agent is the subject and is
             recorded as a TYPED entity reference, ``Agent::"<name>"`` (build one
@@ -2310,6 +2344,11 @@ class Watchlight:
             sink_interval=audit_sink_interval,
         )
         state.strict_principal = bool(strict_principal)
+        state.max_delegation_depth = (
+            DEFAULT_MAX_DELEGATION_DEPTH
+            if max_delegation_depth is None
+            else _check_max_delegation_depth(max_delegation_depth)
+        )
         state.signing_secrets = _resolve_signing_secrets(signing_secret, token_secret)
         state.approval_options = {"secret": approval_secret, "store": approval_store}
         state.approval = ApprovalTokens(
@@ -2443,12 +2482,13 @@ class Watchlight:
         was itself delegated. The engine, the compiled policies, the audit trail
         and the sink are shared with this governor, exactly as for :meth:`as_`.
         Raises :class:`AttenuationDenied` if the request widens the scope and
-        :class:`DevEditionCeiling` past the depth ceiling — which also bounds the
-        chain at :data:`MAX_ACTOR_CHAIN` entries.
+        :class:`DelegationDepthExceeded` past ``max_delegation_depth`` — which also
+        bounds the chain at ``max_delegation_depth + 1`` entries.
         """
         _assert_agent_name(agent, "delegate(parent, agent)")
         scope = parent.delegated_scope if isinstance(parent, Watchlight) else parent
-        if scope is None:
+        # A ScopePreview is data, never authority: only a real scope can delegate.
+        if not isinstance(scope, Scope):
             raise TypeError(
                 "delegate(parent, agent): `parent` must be a scope, or a governor that "
                 "was itself delegated"
@@ -2668,23 +2708,30 @@ class Watchlight:
 
     # ── sub-agent scope attenuation ─────────────────────────────────
 
+    @property
+    def max_delegation_depth(self) -> int:
+        """The sub-agent depth limit in force for this governor — shared with
+        every name made by :meth:`as_` or :meth:`delegate`."""
+        return self._shared.max_delegation_depth
+
     def scope(
         self,
         *,
         tools: Sequence[str] | None = None,
         resources: Sequence[str] | None = None,
         intents: Sequence[str] | None = None,
-        max_depth: int = DE_MAX_DEPTH,
+        max_depth: Optional[int] = None,
         time_budget_seconds: int = 3600,
     ) -> Scope:
         """Create a root capability scope for this agent, from which sub-agent
         scopes are attenuated (strict-subset).
 
-        The Developer Edition governs the tree up to depth
-        :data:`~watchlight.attenuation.DE_MAX_DEPTH` (5); Enterprise removes the
-        ceiling and enforces it server-side. See
+        The tree is bounded by the governor's :attr:`max_delegation_depth`
+        (default 8). ``max_depth`` lowers it for this tree only — it never raises
+        it. A hop past the limit raises :class:`DelegationDepthExceeded`. See
         :class:`~watchlight.attenuation.Scope`.
         """
+        budget = self._root_budget(max_depth)
         root = Scope(
             engine=self._engine,
             audit_path=self._audit_path,
@@ -2693,13 +2740,55 @@ class Watchlight:
             allowed_tools=tools,
             allowed_resources=resources,
             allowed_intents=intents,
-            max_depth=min(int(max_depth), DE_MAX_DEPTH),
+            max_depth=budget,
+            max_delegation_depth=budget,
             time_budget_seconds=time_budget_seconds,
             depth=0,
             signing_secrets=self._signing_secrets,
         )
         root._emit_root()  # record the tree's starting authority for `watchlight dev`
         return root
+
+    def preview_scope(
+        self,
+        *,
+        tools: Sequence[str] | None = None,
+        resources: Sequence[str] | None = None,
+        intents: Sequence[str] | None = None,
+        max_depth: Optional[int] = None,
+        time_budget_seconds: int = 3600,
+    ) -> ScopePreview:
+        """What :meth:`scope` would grant, without granting it or recording
+        anything — for a page that shows an agent's authority. Call
+        :meth:`~watchlight.attenuation.ScopePreview.preview_attenuate` on the
+        result to preview each sub-agent's scope, decided by the same engine
+        check as :meth:`~watchlight.attenuation.Scope.attenuate`. A preview is
+        data, never a scope: it cannot authorize, delegate, or mint a token."""
+        budget = self._root_budget(max_depth)
+        return ScopePreview(
+            engine=self._engine,
+            allowed=True,
+            tools=tools,
+            resources=resources,
+            intents=intents,
+            max_depth=budget,
+            time_budget_seconds=time_budget_seconds,
+            depth=0,
+            max_delegation_depth=budget,
+            actor_chain=(self.agent,),
+        )
+
+    def _root_budget(self, max_depth: Optional[int]) -> int:
+        """A root scope's depth budget: the governor's limit, lowered (never
+        raised) by ``max_depth``."""
+        limit = self._shared.max_delegation_depth
+        if max_depth is None:
+            return limit
+        if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+            raise TypeError("max_depth must be an int")
+        if max_depth < 0:
+            raise ValueError("max_depth must not be negative")
+        return min(max_depth, limit)
 
     def scope_from_token(self, token: str) -> Scope:
         """Re-establish a scope minted by
@@ -2720,11 +2809,14 @@ class Watchlight:
         secrets = require_secrets(self._signing_secrets)
         claims = verify_scope_token_any(token, secrets, agent=self.agent)
         root = claims["root"]
+        # The receiving governor's own max_delegation_depth still applies: a token
+        # cannot carry a deeper tree than this governor permits.
+        root_budget = min(root["max_depth"], self._shared.max_delegation_depth)
         scope = self.scope(
             tools=root["tools"],
             resources=root["resources"],
             intents=root["intents"],
-            max_depth=root["max_depth"],
+            max_depth=root_budget,
             time_budget_seconds=root["time_budget_seconds"],
         )
         for step in claims["chain"]:
@@ -2742,7 +2834,7 @@ class Watchlight:
             or not same_set(scope.allowed_resources, claimed["resources"])
             or not same_set(scope.allowed_intents, claimed["intents"])
             or scope.time_budget_seconds != claimed["time_budget_seconds"]
-            or (not claims["chain"] and scope.max_depth != root["max_depth"])
+            or (not claims["chain"] and scope.max_depth != root_budget)
         ):
             raise ScopeTokenError("mismatch", "engine grant does not match the token's claim")
         scope._bind_expiry(claims["exp"])
@@ -3512,6 +3604,7 @@ class Watchlight:
             # has already resolved it (to the typed Agent::"<name>" by default).
             "principal": self._principal(principal),
             "intent": intent,
+            "event": "decision",
             "resource": resource,
             "decision": decision,
         }
@@ -3621,10 +3714,13 @@ class Watchlight:
         approval_store: Optional[ApprovalStore] = None,
         counter_source: Optional[CounterSource] = None,
         strict_principal: Optional[bool] = None,
+        max_delegation_depth: Optional[int] = None,
     ) -> None:
         """Apply options to the default governor. Behind :func:`configure_default`;
         not part of the public surface."""
         state = self._shared
+        if max_delegation_depth is not None:
+            _check_max_delegation_depth(max_delegation_depth)
         # The environment layer lands FIRST, so an explicit option below
         # overwrites it — option > environment > default, in every order the two
         # can arrive in.
@@ -3641,6 +3737,7 @@ class Watchlight:
                 approval_store=approval_store,
                 counter_source=counter_source,
                 strict_principal=strict_principal,
+                max_delegation_depth=max_delegation_depth,
             )
             if conflict is None:
                 # Every option passed is already in force, so there is nothing to
@@ -3697,6 +3794,8 @@ class Watchlight:
             state.counter_source = counter_source
         if strict_principal is not None:
             state.strict_principal = bool(strict_principal)
+        if max_delegation_depth is not None:
+            state.max_delegation_depth = max_delegation_depth
 
     def _apply_env_defaults(self) -> None:
         """Fold the environment layer — :data:`AUDIT_DIR_ENV` and
@@ -3741,6 +3840,7 @@ class Watchlight:
         approval_store: Optional[ApprovalStore],
         counter_source: Optional[CounterSource],
         strict_principal: Optional[bool],
+        max_delegation_depth: Optional[int] = None,
     ) -> Optional[str]:
         """The first option that would CHANGE the configuration already in force,
         described without ever naming a secret's value — or ``None`` when every
@@ -3797,6 +3897,11 @@ class Watchlight:
                 f"strict_principal would change from {state.strict_principal} "
                 f"to {bool(strict_principal)}"
             )
+        if max_delegation_depth is not None and max_delegation_depth != state.max_delegation_depth:
+            return (
+                f"max_delegation_depth would change from {state.max_delegation_depth} "
+                f"to {max_delegation_depth}"
+            )
         return None
 
 
@@ -3821,6 +3926,7 @@ def configure_default(
     approval_store: Optional[ApprovalStore] = None,
     counter_source: Optional[CounterSource] = None,
     strict_principal: Optional[bool] = None,
+    max_delegation_depth: Optional[int] = None,
 ) -> "Watchlight":
     """Configure the module-level :data:`govern` — the one governor an
     application never constructs, and therefore the one that could not otherwise
@@ -3860,6 +3966,7 @@ def configure_default(
         approval_store=approval_store,
         counter_source=counter_source,
         strict_principal=strict_principal,
+        max_delegation_depth=max_delegation_depth,
     )
     return govern
 

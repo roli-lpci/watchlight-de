@@ -71,12 +71,11 @@ __all__ = [
 #
 # TWO LIMITS, so a sink author is not misled about what these buy:
 #
-#  1. The discriminant is an ABSENT key on a decision record. ``TypedDict``
-#     unions narrow on a literal tag, and there is no literal to read when the
-#     key is missing, so a type checker will not narrow the decision case for
-#     you the way TypeScript's ``event === undefined`` does. Test it at runtime
-#     — ``if "event" not in record:`` — and ``cast`` if your checker needs the
-#     hint. The runtime test itself is exact.
+#  1. A decision record's ``event`` is ``"decision"``, but one written by an
+#     earlier release has no ``event`` key, so the key is optional on
+#     ``DecisionRecord`` and a checker cannot narrow on it alone. Test it at
+#     runtime — ``record.get("event", "decision") == "decision"`` — and ``cast``
+#     if your checker needs the hint. The runtime test itself is exact.
 #  2. The distribution is not marked ``py.typed``. Checkers that read a
 #     library's source anyway (pyright's default) resolve these; ones that
 #     require the marker (mypy) do not, and see the package as untyped.
@@ -103,11 +102,14 @@ class _DecisionRequired(AuditRecordBase):
 
 class DecisionRecord(_DecisionRequired, total=False):
     """A governance decision — written by ``authorize()``, and so by every
-    governed tool call. The ONLY kind with no ``event`` key: that absence is the
-    discriminant. An approved action is two records — the ``NeedsApproval`` hold,
+    governed tool call. Its ``event`` is ``"decision"``; one written by an earlier
+    release has no ``event`` at all, so read a missing ``event`` as a decision
+    too. An approved action is two records — the ``NeedsApproval`` hold,
     then an ``Allow`` carrying ``approved: True`` under a new ``decision_id``. The
     reason is never written; callers see a uniform, non-revealing one."""
 
+    #: ``"decision"``. Absent on a record written by an earlier release.
+    event: Literal["decision"]
     #: The ordered delegation chain, root first. Present ONLY on a record written
     #: through a ``delegate()``d governor, whose chain is longer than one name.
     actor_chain: List[str]
@@ -210,18 +212,28 @@ class _AttenuationRequired(AuditRecordBase):
 class AttenuationRecord(_AttenuationRequired, total=False):
     """One node of a sub-agent scope tree — written by ``scope()`` for the root
     and by every ``attenuate()``, granted or refused. Carries capability NAMES
-    only. Unlike the other kinds it has no ``principal`` and no ``actor_chain``."""
+    only. Unlike the other kinds it has no ``principal``."""
 
     #: Absent on the root.
     parent_id: str
-    #: Present on a ``Deny``: the violated dimension, or the depth-ceiling notice.
+    #: Present on a ``Deny``: the violated dimension(s), or the depth limit.
     reason: str
+    #: Present on a ``Deny`` from ``max_delegation_depth``:
+    #: ``DELEGATION_DEPTH_EXCEEDED``. ``depth`` is the refused child's depth.
+    reason_code: Literal["DELEGATION_DEPTH_EXCEEDED"]
+    #: Present with ``reason_code``: the limit the refused hop exceeded.
+    max_delegation_depth: int
+    #: Present when the scope was granted — or refused — FOR a named sub-agent
+    #: (``attenuate(agent=...)``, ``delegate()``): the chain that sub-agent acts
+    #: under, root first. ``resource`` then reads ``scope for <name>``.
+    actor_chain: List[str]
 
 
 #: One value-free audit record, as delivered to an :data:`AuditSink` — the same
 #: fields the ``.watchlight/audit.jsonl`` line carries, and never argument
 #: values, PII, or secrets. A union over the five kinds, discriminated by the
-#: ``event`` key (absent on a decision, a literal on every other kind), so a sink
+#: ``event`` key (``"decision"`` on a decision — absent on one written by an
+#: earlier release — and a literal on every other kind), so a sink
 #: reads a kind's fields by name and a rename or a removal is a type error rather
 #: than a ``None`` nobody notices. See the two limits noted above.
 AuditRecord = Union[
