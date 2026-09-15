@@ -8,8 +8,8 @@ TRAIL=trail/audit.jsonl              # what generate_trail.py / generate-trail.m
 TRAIL=.watchlight/audit.jsonl        # what any other example leaves behind
 ```
 
-A **decision** record has no `event` field; every other kind names itself in
-`event`. `decision_id` joins them. Field names are in
+Every record names its kind in `event` — `decision` on a decision (one written
+by an earlier release has no `event`). `decision_id` joins them. Field names are in
 [README.md](./README.md#record-kinds).
 
 ## Records by kind

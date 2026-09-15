@@ -79,7 +79,7 @@ async function main() {
     const file = lines(auditDir);
     ok("sink saw every file line, same order, same fields", JSON.stringify(seen) === JSON.stringify(file),
       `${seen.length} vs ${file.length}`);
-    ok("covers decisions", seen.some((r) => r.event === undefined && r.decision === "Allow") && seen.some((r) => r.event === undefined && r.decision === "Deny"));
+    ok("covers decisions", seen.some((r) => r.event === "decision" && r.decision === "Allow") && seen.some((r) => r.event === "decision" && r.decision === "Deny"));
     ok("covers NeedsApproval + approved decision", seen.some((r) => r.decision === "NeedsApproval") && seen.some((r) => r.approved === true && r.decision === "Allow"));
     ok("covers sanitization", seen.some((r) => r.event === "sanitization" && r.counts && r.counts.EMAIL === 1));
     ok("covers attenuation Allow and Deny (escalation + ceiling)",
@@ -223,11 +223,11 @@ async function main() {
   // sanitization and a screening, `withheld` on an egress, `reason` on a refused
   // attenuation. A field the writers emit that the union does not name fails here.
   const FIELDS = {
-    decision: [["ts", "agent", "principal", "intent", "resource", "decision"], ["actor_chain", "decision_id", "approved"]],
+    decision: [["ts", "agent", "principal", "intent", "resource", "decision"], ["event", "actor_chain", "decision_id", "approved"]],
     sanitization: [["ts", "agent", "intent", "event", "resource", "mode", "detector", "counts", "total"], ["actor_chain", "decision_id", "principal"]],
     screening: [["ts", "agent", "intent", "event", "resource", "mode", "detector", "counts", "total", "flagged"], ["actor_chain", "decision_id", "principal"]],
     egress: [["ts", "agent", "principal", "intent", "event", "resource", "replaced"], ["actor_chain", "decision_id", "withheld"]],
-    attenuation: [["ts", "agent", "intent", "event", "node_id", "resource", "decision", "depth", "tools"], ["parent_id", "reason"]],
+    attenuation: [["ts", "agent", "intent", "event", "node_id", "resource", "decision", "depth", "tools"], ["parent_id", "reason", "actor_chain"]],
   };
   {
     const seen = [];
@@ -269,7 +269,7 @@ async function main() {
       ["decision", "sanitization", "screening", "egress", "attenuation"].every((k) => kinds.has(k)),
       [...kinds].join(","));
     ok("`event` is the discriminant: absent on a decision, a literal on every other kind",
-      file.every((r) => (kindOf(r) === "decision" ? !("event" in r) : r.event === kindOf(r))));
+      file.every((r) => r.event === kindOf(r)));
     // The conditional fields really do appear — otherwise the check above is vacuous.
     ok("actor_chain appears only on records written through a delegate",
       file.some((r) => Array.isArray(r.actor_chain) && r.actor_chain.length > 1) &&
@@ -279,8 +279,8 @@ async function main() {
       file.some((r) => r.event === "screening" && r.principal === alice && r.decision_id === d.decisionId));
     ok("an approved decision is a hold then an Allow with approved: true",
       held.decision === "NeedsApproval" &&
-      file.some((r) => !("event" in r) && r.decision === "NeedsApproval" && r.approved === undefined) &&
-      file.some((r) => !("event" in r) && r.decision === "Allow" && r.approved === true));
+      file.some((r) => r.event === "decision" && r.decision === "NeedsApproval" && r.approved === undefined) &&
+      file.some((r) => r.event === "decision" && r.decision === "Allow" && r.approved === true));
     ok("egress records carry replaced, and withheld only when the hook refused",
       file.some((r) => r.event === "egress" && r.replaced === true && r.withheld === undefined) &&
       file.some((r) => r.event === "egress" && r.replaced === false && r.withheld === true));
@@ -288,7 +288,11 @@ async function main() {
       file.some((r) => r.event === "attenuation" && r.decision === "Allow" && r.parent_id === undefined && r.depth === 0) &&
       file.some((r) => r.event === "attenuation" && r.decision === "Allow" && typeof r.parent_id === "string") &&
       file.some((r) => r.event === "attenuation" && r.decision === "Deny" && typeof r.reason === "string") &&
-      file.every((r) => r.event !== "attenuation" || (r.intent === "attenuate" && r.principal === undefined && r.actor_chain === undefined)));
+      file.every((r) => r.event !== "attenuation" || (r.intent === "attenuate" && r.principal === undefined)) &&
+      // A scope granted FOR a named sub-agent (the delegate above) names it.
+      file.some((r) => r.event === "attenuation" && r.resource === "scope for sub-agent" &&
+        Array.isArray(r.actor_chain) && r.actor_chain.at(-1) === "sub-agent") &&
+      file.some((r) => r.event === "attenuation" && r.depth === 1 && r.actor_chain === undefined));
   }
 
   // ── batching: the sink off the request path ──

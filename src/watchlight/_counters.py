@@ -280,9 +280,10 @@ def _tally_line(raw: bytes, f: dict, t: _Tally) -> None:
     if not isinstance(rec, dict):
         t.skipped += 1
         return
-    # Records that carry an `event` (sanitization, egress, attenuation) are
-    # well-formed but are not decisions.
-    if "event" in rec:
+    # Records whose `event` names another kind (sanitization, egress,
+    # attenuation) are well-formed but are not decisions. A decision's `event` is
+    # "decision"; one written by an earlier release has none.
+    if rec.get("event", "decision") != "decision":
         t.records += 1
         return
     decision = rec.get("decision")

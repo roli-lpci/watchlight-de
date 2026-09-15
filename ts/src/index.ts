@@ -18,7 +18,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
-import { Scope, DEFAULT_MAX_DELEGATION_DEPTH, type AttenuateOptions } from "./attenuation";
+import { Scope, DEFAULT_MAX_DELEGATION_DEPTH, type AttenuateOptions, ScopePreview } from "./attenuation";
 import { MAX_CHAIN_LENGTH as DEPTH_BOUND } from "./scope-token";
 import {
   AuditTrail,
@@ -78,6 +78,7 @@ export {
   DELEGATION_DEPTH_EXCEEDED,
   AttenuationDenied,
   DelegationDepthExceeded,
+  ScopePreview,
 } from "./attenuation";
 export type {
   AuditRecord,
@@ -1073,7 +1074,8 @@ export class Watchlight {
   delegate(from: Scope | Watchlight, agent: string, opts: AttenuateOptions = {}): Watchlight {
     assertAgentName(agent, "delegate(from, agent)");
     const parent = from instanceof Watchlight ? from.delegatedScope : from;
-    if (!parent) {
+    // A ScopePreview is data, never authority: only a real scope can delegate.
+    if (!(parent instanceof Scope)) {
       throw new TypeError(
         "delegate(from, agent): `from` must be a scope, or a governor that was itself delegated"
       );
@@ -1282,14 +1284,7 @@ export class Watchlight {
   }
 
   async scope(opts: ScopeOptions = {}): Promise<Scope> {
-    const limit = this._shared.maxDelegationDepth;
-    if (opts.maxDepth !== undefined) {
-      if (typeof opts.maxDepth !== "number" || !Number.isInteger(opts.maxDepth)) {
-        throw new TypeError("maxDepth must be an integer");
-      }
-      if (opts.maxDepth < 0) throw new RangeError("maxDepth must not be negative");
-    }
-    const budget = opts.maxDepth === undefined ? limit : Math.min(opts.maxDepth, limit);
+    const budget = this._rootBudget(opts.maxDepth);
     const eng = this._backend.engine();
     if (!eng) {
       throw new Error(
@@ -1313,6 +1308,49 @@ export class Watchlight {
     });
     root.emitRoot();
     return root;
+  }
+
+  /**
+   * What {@link scope} would grant, without granting it or recording anything —
+   * for a page that shows an agent's authority. Call
+   * {@link ScopePreview.previewAttenuate} on the result to preview each
+   * sub-agent's scope, decided by the same engine check as
+   * {@link Scope.attenuate}. A preview is data, never a scope: it cannot
+   * authorize, delegate, or mint a token.
+   */
+  async previewScope(opts: ScopeOptions = {}): Promise<ScopePreview> {
+    const budget = this._rootBudget(opts.maxDepth);
+    const eng = this._backend.engine();
+    if (!eng) {
+      throw new Error(
+        "sub-agent attenuation runs in-process; with WATCHLIGHT_APDP_URL set it is " +
+          "enforced by the control plane server-side. Use the Enterprise API for networked attenuation."
+      );
+    }
+    return new ScopePreview({
+      engine: await eng,
+      allowed: true,
+      allowedTools: norm(opts.tools),
+      allowedResources: norm(opts.resources),
+      allowedIntents: norm(opts.intents),
+      maxDepth: budget,
+      timeBudgetSeconds: opts.timeBudgetSeconds ?? 3600,
+      depth: 0,
+      maxDelegationDepth: budget,
+      actorChain: [this.agent],
+    });
+  }
+
+  /** A root scope's depth budget: the governor's limit, lowered (never raised)
+   *  by `maxDepth`. */
+  private _rootBudget(maxDepth: number | undefined): number {
+    const limit = this._shared.maxDelegationDepth;
+    if (maxDepth === undefined) return limit;
+    if (typeof maxDepth !== "number" || !Number.isInteger(maxDepth)) {
+      throw new TypeError("maxDepth must be an integer");
+    }
+    if (maxDepth < 0) throw new RangeError("maxDepth must not be negative");
+    return Math.min(maxDepth, limit);
   }
 
   /**
@@ -1973,6 +2011,7 @@ export class Watchlight {
       // already resolved it (to the typed Agent::"<name>" by default).
       principal: this._principal(extra.principal),
       intent,
+      event: "decision",
       resource,
       decision,
     };

@@ -11,6 +11,25 @@ upgrade is worth your afternoon.
 
 Each entry links to its release, which carries the reasoning and the measurements.
 
+## Unreleased
+
+Audit records say more about sub-agent scopes, and you can look at a scope
+without recording a grant. One change affects code that reads the trail.
+
+**Added**
+- `govern.preview_scope()` / `govern.previewScope()` and
+  `Scope.preview_attenuate()` / `Scope.previewAttenuate()` return a
+  `ScopePreview`: what a scope would be granted, decided by the same engine
+  check, with nothing recorded. A preview cannot authorize, delegate or mint a
+  token.
+- An attenuation record for a named sub-agent (`attenuate(agent=…)`,
+  `delegate()`) carries that sub-agent's `actor_chain`, and its `resource` reads
+  `scope for <name>` — on grants and refusals alike.
+
+**Changed**
+- Decision records carry `"event": "decision"`. See
+  [breaking changes](docs/breaking-changes.md).
+
 ## 0.12.0 — 2026-09-12
 
 Delegation depth becomes a governance control, and the engine licence no longer

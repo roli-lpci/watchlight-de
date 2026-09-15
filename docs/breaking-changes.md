@@ -8,6 +8,27 @@ different verdict. Only some announce themselves; the rest surface as a denial
 that looks exactly like a policy of yours doing its job. Read every entry
 between the version you are on and the one you are moving to.
 
+## Unreleased
+
+**Decision records carry `"event": "decision"`.** Every other record kind already
+named itself in `event`; a decision record had none, and that absence was how a
+reader told it apart. A reader that finds decisions by testing for a missing
+`event` now misses every new one — silently: a quota counts zero, a report shows
+no decisions.
+
+Records written by earlier releases still have no `event`, so a trail that spans
+the upgrade holds both. Read a missing `event` as a decision:
+
+```python
+is_decision = record.get("event", "decision") == "decision"   # was: "event" not in record
+```
+
+```ts
+const isDecision = (r.event ?? "decision") === "decision";    // was: r.event === undefined
+```
+
+`counters()` and the TypeScript `AuditRecord` types already read both.
+
 ## 0.12.0
 
 **The depth-5 attenuation cap is gone; `max_delegation_depth` replaces it.**

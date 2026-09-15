@@ -150,9 +150,9 @@ async function main() {
 
   const recs2 = fs.readFileSync(join(auditDir, "audit.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
   ok("slow: withheld egress record joined to its decision",
-    recs2.some((r) => r.event === "egress" && r.withheld === true && r.decision_id && recs2.some((d) => !d.event && d.decision_id === r.decision_id && d.decision === "Allow")));
+    recs2.some((r) => r.event === "egress" && r.withheld === true && r.decision_id && recs2.some((d) => d.event === "decision" && d.decision_id === r.decision_id && d.decision === "Allow")));
   ok("no-id: egress record present without decision_id", recs2.some((r) => r.event === "egress" && r.replaced === true && !("decision_id" in r)));
-  const dec1 = recs2.find((r) => r.decision_id === infos[0].decisionId && !r.event);
+  const dec1 = recs2.find((r) => r.decision_id === infos[0].decisionId && r.event === "decision");
   const egr1 = recs2.find((r) => r.event === "egress" && r.decision_id === infos[0].decisionId);
   ok("egress record joined to the decision record by decision_id",
     dec1?.decision === "Allow" && dec1?.resource === "tool/WebSearch" && egr1?.replaced === true, JSON.stringify([dec1, egr1]));

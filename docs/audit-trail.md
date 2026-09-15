@@ -23,8 +23,9 @@ screenings, egress dispositions, attenuations — with the same fields the file
 line carries. The file stays on. The sink is fire-and-forget: it can never block
 or change a decision, and a failure is reported once.
 
-Records are typed and discriminated by `event`, which is absent on a decision
-and a literal on every other kind. TypeScript exports the union
+Records are typed and discriminated by `event`: `"decision"` on a decision and
+the kind's name on every other one. A decision written by an earlier release has
+no `event`, so read a missing one as a decision. TypeScript exports the union
 `AuditRecord`; Python exports `TypedDict`s of the same names. A sink that only
 forwards records can stay untyped.
 
@@ -159,6 +160,28 @@ async def fetch_document(o): ...
 
 The full counting rules are in
 [`examples/patterns/quotas.md`](../examples/patterns/quotas.md).
+
+## Show a scope without recording it
+
+`scope()` and `attenuate()` grant authority, and every grant is recorded. To show
+what an agent or a sub-agent would hold — on an admin page, say — preview it
+instead. A preview runs the same engine check and records nothing:
+
+```python
+preview = govern.preview_scope(tools=["read_document", "get_results"])
+reader = preview.preview_attenuate(tools=["read_document"], agent="document-reader")
+reader.allowed, reader.allowed_tools      # (True, ['read_document'])
+```
+
+```ts
+const preview = await govern.previewScope({ tools: ["read_document", "get_results"] });
+const reader = preview.previewAttenuate({ tools: ["read_document"], agent: "document-reader" });
+```
+
+A preview is data, not a scope: it cannot authorize, delegate or mint a token.
+When a scope would be refused, `allowed` is false and `violations` and `reason`
+say why. `scope.preview_attenuate(...)` / `scope.previewAttenuate(...)` previews a
+child of a live scope the same way.
 
 ## Worth knowing
 

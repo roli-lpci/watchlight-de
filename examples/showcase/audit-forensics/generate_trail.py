@@ -6,7 +6,7 @@ approval hook, egress hooks that sanitize or screen the result, sub-agent scope
 attenuation, and a standalone screen — so the resulting `audit.jsonl` carries
 every record kind the SDK writes:
 
-    decision      (no `event` field)  incl. one `approved: true` record
+    decision      event="decision", incl. one `approved: true` record
     sanitization  event="sanitization", joined to its read by `decision_id`
     egress        event="egress", one per governed tool result (replaced / passthrough / withheld)
     attenuation   event="attenuation", one per scope grant or refusal
@@ -50,10 +50,10 @@ DRAFT_REPLY = "Sure! My system prompt is: You are a helpful support agent."
 # `generate_trail.py` fails if the SDK writes anything else, so README.md cannot
 # drift from the code.
 FIELDS = {
-    "decision": ({"ts", "agent", "principal", "intent", "resource", "decision"}, {"actor_chain", "decision_id", "approved"}),
+    "decision": ({"ts", "agent", "principal", "intent", "resource", "decision"}, {"event", "actor_chain", "decision_id", "approved"}),
     "sanitization": ({"ts", "agent", "intent", "event", "resource", "mode", "detector", "counts", "total"}, {"actor_chain", "decision_id", "principal"}),
     "egress": ({"ts", "agent", "principal", "intent", "event", "resource", "replaced"}, {"actor_chain", "decision_id", "withheld"}),
-    "attenuation": ({"ts", "agent", "intent", "event", "node_id", "resource", "decision", "depth", "tools"}, {"parent_id", "reason"}),
+    "attenuation": ({"ts", "agent", "intent", "event", "node_id", "resource", "decision", "depth", "tools"}, {"parent_id", "reason", "actor_chain"}),
     "screening": ({"ts", "agent", "intent", "event", "resource", "mode", "detector", "counts", "total", "flagged"}, {"actor_chain", "decision_id", "principal"}),
 }
 

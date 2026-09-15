@@ -50,11 +50,11 @@ t.ok("all five record kinds arrive",
 // and the shape the SDK's exported `AuditRecord` union types. A sink that maps a
 // record field by field is entitled to rely on exactly this and nothing more.
 const FIELDS = {
-  decision: [["ts", "agent", "principal", "intent", "resource", "decision"], ["actor_chain", "decision_id", "approved"]],
+  decision: [["ts", "agent", "principal", "intent", "resource", "decision"], ["event", "actor_chain", "decision_id", "approved"]],
   sanitization: [["ts", "agent", "intent", "event", "resource", "mode", "detector", "counts", "total"], ["actor_chain", "decision_id", "principal"]],
   screening: [["ts", "agent", "intent", "event", "resource", "mode", "detector", "counts", "total", "flagged"], ["actor_chain", "decision_id", "principal"]],
   egress: [["ts", "agent", "principal", "intent", "event", "resource", "replaced"], ["actor_chain", "decision_id", "withheld"]],
-  attenuation: [["ts", "agent", "intent", "event", "node_id", "resource", "decision", "depth", "tools"], ["parent_id", "reason"]],
+  attenuation: [["ts", "agent", "intent", "event", "node_id", "resource", "decision", "depth", "tools"], ["parent_id", "reason", "actor_chain"]],
 };
 const fieldProblems = received.flatMap((r) => {
   const kind = r.event ?? "decision";
@@ -67,11 +67,8 @@ const fieldProblems = received.flatMap((r) => {
 });
 t.ok("each kind carries exactly the fields it is documented and typed to carry",
   fieldProblems.length === 0, fieldProblems.join("; "));
-t.ok("`event` is the discriminant — absent on a decision, a known name on the rest",
-  received.every((r) =>
-    "event" in r
-      ? ["sanitization", "screening", "egress", "attenuation"].includes(r.event)
-      : typeof r.decision === "string" && typeof r.principal === "string"));
+t.ok("`event` names the kind — `decision` on a decision, a known name on the rest",
+  received.every((r) => ["decision", "sanitization", "screening", "egress", "attenuation"].includes(r.event)));
 t.ok("the sanitization record joins the decision on decision_id",
   received.find((r) => r.event === "sanitization")?.decision_id === allow.decisionId);
 t.ok("records are value-free — no argument values, no text",

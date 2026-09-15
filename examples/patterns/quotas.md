@@ -81,7 +81,8 @@ Proved by [`suites/quotas.suite.json`](./suites/quotas.suite.json).
 `{ count, window: { seconds, start, end }, records, skipped, truncated }` plus the
 filter it applied. Both lanes behave identically.
 
-- **Only decision records** — a line with a `decision` and no `event`.
+- **Only decision records** — a line whose `event` is `decision` (or absent, on
+  a line written by an earlier release).
   `sanitization`, `screening`, `egress` and `attenuation` are read past.
 - **`outcome`** — `allowed` (default) is `Allow`, including approved ones;
   `denied` is `Deny` plus `NeedsApproval` holds; `all` is both.
