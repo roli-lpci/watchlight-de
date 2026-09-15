@@ -218,3 +218,104 @@ def test_attenuate_with_resources_round_trips_matchers(tmp_path):
     assert child.allowed_resources == ["docs/*"]
     with pytest.raises(AttenuationDenied):
         root.attenuate(resources=["docs/*", "hr/*"])
+
+
+# ── a named sub-agent is on its attenuation record ─────────────────
+
+
+def _recs(tmp_path):
+    audit = tmp_path / ".watchlight" / "audit.jsonl"
+    return [json.loads(line) for line in audit.read_text().splitlines()] if audit.exists() else []
+
+
+def test_a_named_attenuation_record_names_the_sub_agent(tmp_path):
+    root = _gov(tmp_path).scope(tools=["read", "write"], intents=["research"])
+    root.attenuate(tools=["read"], agent="document-reader")
+    named = _recs(tmp_path)[-1]
+    assert named["resource"] == "scope for document-reader"
+    assert named["actor_chain"] == ["test-agent", "document-reader"]
+    # Narrowing without naming a new actor keeps today's shape.
+    root.attenuate(tools=["read"])
+    unnamed = _recs(tmp_path)[-1]
+    assert unnamed["resource"] == "sub-agent depth 1"
+    assert "actor_chain" not in unnamed
+
+
+def test_delegate_records_the_sub_agent_it_names(tmp_path):
+    g = _gov(tmp_path)
+    root = g.scope(tools=["read", "write"], intents=["research"])
+    g.delegate(root, "document-reader", tools=["read"])
+    rec = _recs(tmp_path)[-1]
+    assert rec["decision"] == "Allow"
+    assert rec["resource"] == "scope for document-reader"
+    assert rec["actor_chain"] == ["test-agent", "document-reader"]
+
+
+def test_a_refused_named_attenuation_names_the_sub_agent(tmp_path):
+    root = _gov(tmp_path).scope(tools=["read"], intents=["research"])
+    with pytest.raises(AttenuationDenied):
+        root.attenuate(tools=["delete"], agent="rogue")
+    rec = _recs(tmp_path)[-1]
+    assert rec["decision"] == "Deny"
+    assert rec["resource"] == "scope for rogue"
+    assert rec["actor_chain"] == ["test-agent", "rogue"]
+
+
+def test_a_named_hop_past_the_depth_limit_names_the_sub_agent(tmp_path):
+    root = _gov(tmp_path).scope(tools=["read"], max_depth=0)
+    with pytest.raises(DelegationDepthExceeded):
+        root.attenuate(tools=["read"], agent="deep-reader")
+    rec = _recs(tmp_path)[-1]
+    assert rec["reason_code"] == "DELEGATION_DEPTH_EXCEEDED"
+    assert rec["resource"] == "scope for deep-reader"
+    assert rec["actor_chain"] == ["test-agent", "deep-reader"]
+
+
+# ── previews: what a scope would grant, with nothing recorded ──────
+
+
+def test_previews_record_nothing(tmp_path):
+    g = _gov(tmp_path)
+    preview = g.preview_scope(tools=["read", "write"], intents=["research"])
+    reader = preview.preview_attenuate(tools=["read"], agent="document-reader")
+    refused = preview.preview_attenuate(tools=["delete"])
+    assert _recs(tmp_path) == []
+    assert reader.allowed and reader.allowed_tools == ["read"] and reader.depth == 1
+    assert reader.actor_chain == ("test-agent", "document-reader")
+    assert not refused.allowed and refused.violations and refused.reason
+    assert refused.allowed_tools == ["delete"]
+
+
+def test_a_preview_matches_what_attenuate_grants(tmp_path):
+    g = _gov(tmp_path)
+    root = g.scope(tools=["read", "write"], intents=["research", "analysis"])
+    written = len(_recs(tmp_path))
+    preview = root.preview_attenuate(tools=["read"], intents=["research"])
+    assert len(_recs(tmp_path)) == written, "a preview must not write a record"
+    child = root.attenuate(tools=["read"], intents=["research"])
+    assert preview.allowed
+    assert preview.allowed_tools == child.allowed_tools
+    assert preview.allowed_intents == child.allowed_intents
+    assert preview.depth == child.depth
+    assert preview.to_dict()["tools"] == child.allowed_tools
+
+
+def test_a_preview_past_the_depth_limit_says_so(tmp_path):
+    preview = _gov(tmp_path).preview_scope(tools=["read"], max_depth=0)
+    hop = preview.preview_attenuate(tools=["read"])
+    assert not hop.allowed
+    assert hop.reason_code == "DELEGATION_DEPTH_EXCEEDED"
+    below = hop.preview_attenuate(tools=["read"])
+    assert not below.allowed, "nothing is granted below a refused preview"
+    assert hop.to_dict()["reason_code"] == "DELEGATION_DEPTH_EXCEEDED"
+
+
+def test_a_preview_is_not_a_scope(tmp_path):
+    g = _gov(tmp_path)
+    preview = g.preview_scope(tools=["read"])
+    assert not hasattr(preview, "attenuate")
+    assert not hasattr(preview, "to_token")
+    with pytest.raises(TypeError):
+        g.delegate(preview, "document-reader")
+    assert _recs(tmp_path) == []
+

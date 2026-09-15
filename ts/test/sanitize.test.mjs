@@ -98,7 +98,7 @@ async function main() {
   const sr = gc.sanitize(SAMPLE, { intent: "read", resource: "statement.pdf", decisionId: decision.decisionId });
   ok("governed sanitize echoes decisionId on the report", sr.report.decisionId === decision.decisionId);
   const lines = fs.readFileSync(join(corrDir, "audit.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  const authLine = lines.find((l) => l.decision === "Allow" && !l.event);
+  const authLine = lines.find((l) => l.decision === "Allow" && l.event === "decision");
   const sanLine = lines.find((l) => l.event === "sanitization");
   ok("two audit lines share decision_id", authLine && sanLine && authLine.decision_id === decision.decisionId && sanLine.decision_id === decision.decisionId);
   ok("sanitization line keeps its existing fields", sanLine.mode === "tag" && sanLine.detector && sanLine.total >= 8 && sanLine.counts.EMAIL === 2);

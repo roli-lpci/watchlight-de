@@ -302,9 +302,10 @@ function tallyLine(
     return;
   }
   const r = rec as Record<string, unknown>;
-  // Records that carry an `event` (sanitization, egress, attenuation) are
-  // well-formed but are not decisions.
-  if ("event" in r) {
+  // Records whose `event` names another kind (sanitization, egress,
+  // attenuation) are well-formed but are not decisions. A decision's `event` is
+  // "decision"; one written by an earlier release has none.
+  if ("event" in r && r.event !== "decision") {
     t.records += 1;
     return;
   }

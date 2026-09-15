@@ -26,7 +26,7 @@ const db = {
   // The read side — a network call in real life, hence the promise.
   async countDecisions({ principal, intent, after, until }) {
     return this.rows.filter((r) =>
-      r.event === undefined && r.decision === "Allow" &&
+      (r.event ?? "decision") === "decision" && r.decision === "Allow" &&
       r.principal === principal && (intent === undefined || r.intent === intent) &&
       r.ts > after && r.ts <= until).length;
   },
@@ -80,7 +80,7 @@ try {
   t.ok("the tool body never ran on the denial", bodyRuns === 100);
   t.ok("the denial says only 'not authorized'", denied?.reason === "not authorized");
   t.ok("the denial is on the trail the store holds",
-    db.rows.some((r) => r.event === undefined && r.decision === "Deny"));
+    db.rows.some((r) => (r.event ?? "decision") === "decision" && r.decision === "Deny"));
 
   // A synchronous binding cannot read an async source: it fails closed by name,
   // never falling back to a local file that is not even being written.

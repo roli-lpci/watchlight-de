@@ -31,6 +31,7 @@ from .scope_token import MAX_CHAIN_LENGTH, ScopeTokenError, now_seconds, sign_sc
 
 __all__ = [
     "Scope",
+    "ScopePreview",
     "AttenuationDenied",
     "DelegationDepthExceeded",
     "DEFAULT_MAX_DELEGATION_DEPTH",
@@ -91,6 +92,72 @@ def _matchers(resources: Sequence[str]) -> list[dict[str, str]]:
 
 def _unmatchers(resources: Sequence[Any]) -> list[str]:
     return [r["matcher"] if isinstance(r, dict) else str(r) for r in resources]
+
+
+def _scope_label(depth: int, agent: str | None) -> str:
+    """An attenuation record's ``resource``: the sub-agent the scope is for, when
+    one is named, else the depth."""
+    return f"scope for {agent}" if agent else f"sub-agent depth {depth}"
+
+
+def _attenuation_outcome(
+    parent: Any,
+    *,
+    tools: Sequence[str] | None,
+    resources: Sequence[str] | None,
+    intents: Sequence[str] | None,
+    time_budget_seconds: int | None,
+) -> dict[str, Any]:
+    """Run the engine's strict-subset check for a child of ``parent`` (a
+    :class:`Scope` or a :class:`ScopePreview`). Creates and records nothing: the
+    one decision both :meth:`Scope.attenuate` and the previews act on, so the two
+    cannot disagree.
+
+    Returns ``{"kind": "depth" | "deny" | "allow", ...}``."""
+    child_depth = parent.depth + 1
+    requested_tools = _norm(tools) if tools is not None else parent.allowed_tools
+
+    # max_delegation_depth — a governance control, checked before the engine.
+    if child_depth > parent.max_delegation_depth:
+        return {"kind": "depth", "requested_tools": requested_tools, "child_depth": child_depth}
+
+    request = {
+        "allowed_tools": requested_tools,
+        "allowed_resources": _matchers(_norm(resources) if resources is not None else parent.allowed_resources),
+        "allowed_intents": _norm(intents) if intents is not None else parent.allowed_intents,
+        "max_depth": max(0, parent.max_depth - 1),
+        "time_budget_seconds": (
+            time_budget_seconds if time_budget_seconds is not None else parent.time_budget_seconds
+        ),
+    }
+    resp = json.loads(parent._engine.attenuate_scope(json.dumps(parent._as_dict()), json.dumps(request)))
+    if resp.get("decision") != "Allow":
+        violations = resp.get("violations") or []
+        if "MaxDepth" in violations and parent.max_depth <= 0:
+            # The engine's own depth budget is spent — the same deny.
+            return {"kind": "depth", "requested_tools": requested_tools, "child_depth": child_depth}
+        return {
+            "kind": "deny",
+            "requested_tools": requested_tools,
+            "child_depth": child_depth,
+            "violations": violations,
+            "reason": resp.get("reason") or "requested scope is not a strict subset of the parent",
+        }
+
+    # The engine returns the CLAMPED grant — never the child's raw request.
+    granted = resp.get("granted_scope") or {}
+    return {
+        "kind": "allow",
+        "child_depth": child_depth,
+        "grant": {
+            "allowed_tools": granted.get("allowed_tools", request["allowed_tools"]),
+            "allowed_resources": _unmatchers(granted.get("allowed_resources", request["allowed_resources"])),
+            "allowed_intents": granted.get("allowed_intents", request["allowed_intents"]),
+            "max_depth": granted.get("max_depth", request["max_depth"]),
+            "time_budget_seconds": granted.get("time_budget_seconds", request["time_budget_seconds"]),
+            "depth": granted.get("depth", child_depth),
+        },
+    }
 
 
 class Scope:
@@ -267,57 +334,38 @@ class Scope:
         new actor: the child then inherits the parent's chain unchanged.
         """
         self.assert_active()  # a spent scope grants nothing further (fail-closed)
-        child_depth = self.depth + 1
-        requested_tools = _norm(tools) if tools is not None else self.allowed_tools
-
-        # max_delegation_depth — a governance control, checked before the engine.
-        # A hop past it is a deny: the child is never created.
-        if child_depth > self.max_delegation_depth:
-            self._deny_depth(requested_tools, child_depth)
-
-        parent = self._as_dict()
-        request = {
-            "allowed_tools": requested_tools,
-            "allowed_resources": _matchers(_norm(resources) if resources is not None else self.allowed_resources),
-            "allowed_intents": _norm(intents) if intents is not None else self.allowed_intents,
-            "max_depth": max(0, self.max_depth - 1),
-            "time_budget_seconds": (
-                time_budget_seconds if time_budget_seconds is not None else self.time_budget_seconds
-            ),
-        }
-
-        resp = json.loads(
-            self._engine.attenuate_scope(json.dumps(parent), json.dumps(request))
+        # A named sub-agent's records carry the chain it would act under.
+        named = (*self.actor_chain, agent) if agent else None
+        out = _attenuation_outcome(
+            self, tools=tools, resources=resources, intents=intents, time_budget_seconds=time_budget_seconds
         )
-        if resp.get("decision") != "Allow":
-            violations = resp.get("violations") or []
-            if "MaxDepth" in violations and self.max_depth <= 0:
-                # The engine's own depth budget is spent — the same deny.
-                self._deny_depth(requested_tools, child_depth)
-            reason = resp.get("reason") or "requested scope is not a strict subset of the parent"
+        if out["kind"] == "depth":
+            # A hop past max_delegation_depth is a deny: the child is never created.
+            self._deny_depth(out["requested_tools"], out["child_depth"], agent)
+        if out["kind"] == "deny":
             self._record(
                 node_id=uuid.uuid4().hex[:8],
                 parent_id=self.node_id,
-                tools=requested_tools,
-                resource=f"sub-agent depth {child_depth}",
+                tools=out["requested_tools"],
+                resource=_scope_label(out["child_depth"], agent),
                 decision="Deny",
-                depth=child_depth,
-                reason=reason,
+                depth=out["child_depth"],
+                reason=out["reason"],
+                actor_chain=named,
             )
-            raise AttenuationDenied(violations, reason)
+            raise AttenuationDenied(out["violations"], out["reason"])
 
-        # The engine returns the CLAMPED grant — never the child's raw request.
-        granted = resp.get("granted_scope") or {}
+        grant = out["grant"]
         child = Scope(
             engine=self._engine,
             audit_path=self._audit_path,
             agent=self.agent,
-            allowed_tools=granted.get("allowed_tools", request["allowed_tools"]),
-            allowed_resources=_unmatchers(granted.get("allowed_resources", request["allowed_resources"])),
-            allowed_intents=granted.get("allowed_intents", request["allowed_intents"]),
-            max_depth=granted.get("max_depth", request["max_depth"]),
-            time_budget_seconds=granted.get("time_budget_seconds", request["time_budget_seconds"]),
-            depth=granted.get("depth", child_depth),
+            allowed_tools=grant["allowed_tools"],
+            allowed_resources=grant["allowed_resources"],
+            allowed_intents=grant["allowed_intents"],
+            max_depth=grant["max_depth"],
+            time_budget_seconds=grant["time_budget_seconds"],
+            depth=grant["depth"],
             max_delegation_depth=self.max_delegation_depth,
             parent_id=self.node_id,
             audit=self._audit,
@@ -326,19 +374,40 @@ class Scope:
             # Naming the sub-agent this scope is spawned for extends the
             # delegation chain; narrowing without a name leaves the acting
             # identity unchanged.
-            actor_chain=(*self.actor_chain, agent) if agent else self.actor_chain,
+            actor_chain=named if named else self.actor_chain,
         )
         self._record(
             node_id=child.node_id,
             parent_id=self.node_id,
             tools=child.allowed_tools,
-            resource=f"sub-agent depth {child.depth}",
+            resource=_scope_label(child.depth, agent),
             decision="Allow",
             depth=child.depth,
+            actor_chain=named,
         )
         return child
 
-    def _deny_depth(self, requested_tools: Sequence[str], child_depth: int) -> NoReturn:
+    def preview_attenuate(
+        self,
+        *,
+        tools: Sequence[str] | None = None,
+        resources: Sequence[str] | None = None,
+        intents: Sequence[str] | None = None,
+        time_budget_seconds: int | None = None,
+        agent: str | None = None,
+    ) -> "ScopePreview":
+        """What :meth:`attenuate` would grant, without granting it or recording
+        anything — for showing a sub-agent's effective authority. Runs the same
+        engine check and returns a :class:`ScopePreview`: the clamped grant, or
+        the violations and reason it would be refused with. A preview is data,
+        never a scope: it cannot authorize, delegate, or mint a token."""
+        self.assert_active()
+        return _preview_child(
+            self, tools=tools, resources=resources, intents=intents,
+            time_budget_seconds=time_budget_seconds, agent=agent,
+        )
+
+    def _deny_depth(self, requested_tools: Sequence[str], child_depth: int, agent: str | None = None) -> NoReturn:
         """Refuse a hop past :attr:`max_delegation_depth`: record the deny — the
         observed depth and the limit — then raise. The child is never created."""
         err = DelegationDepthExceeded(child_depth, self.max_delegation_depth)
@@ -346,12 +415,13 @@ class Scope:
             node_id=uuid.uuid4().hex[:8],
             parent_id=self.node_id,
             tools=requested_tools,
-            resource=f"sub-agent depth {child_depth}",
+            resource=_scope_label(child_depth, agent),
             decision="Deny",
             depth=child_depth,
             reason=err.reason,
             reason_code=DELEGATION_DEPTH_EXCEEDED,
             max_delegation_depth=self.max_delegation_depth,
+            actor_chain=(*self.actor_chain, agent) if agent else None,
         )
         raise err
 
@@ -391,6 +461,7 @@ class Scope:
         reason: str = "",
         reason_code: str = "",
         max_delegation_depth: int | None = None,
+        actor_chain: Sequence[str] | None = None,
     ) -> None:
         # Value-free by construction — a scope's dimensions are capability NAMES,
         # never argument values. Shape stays compatible with `watchlight dev`'s
@@ -415,6 +486,9 @@ class Scope:
             record["reason_code"] = reason_code
         if max_delegation_depth is not None:
             record["max_delegation_depth"] = max_delegation_depth
+        # The named sub-agent the scope is for, and the chain it acts under.
+        if actor_chain:
+            record["actor_chain"] = list(actor_chain)
         # One funnel: the governor's file + optional sink (see watchlight._audit).
         self._audit.write(record)
 
@@ -423,3 +497,169 @@ class Scope:
             f"Scope(depth={self.depth}, tools={self.allowed_tools}, "
             f"intents={self.allowed_intents}, max_depth={self.max_depth})"
         )
+
+
+class ScopePreview:
+    """What a scope would be granted — the engine's answer, as data, with nothing
+    recorded.
+
+    Returned by :meth:`watchlight.Watchlight.preview_scope` and
+    :meth:`Scope.preview_attenuate`, for showing an agent's effective authority
+    without writing to the audit trail. It runs the same engine strict-subset
+    check as :meth:`Scope.attenuate`, but it is not a grant: it has no
+    ``attenuate``, cannot authorize, delegate or mint a token, and nothing is
+    recorded. :meth:`preview_attenuate` previews the next level down.
+
+    ``allowed`` says whether the scope would be granted. When it would not,
+    ``violations`` and ``reason`` say why (``reason_code`` is
+    ``DELEGATION_DEPTH_EXCEEDED`` for a hop past the depth limit) and ``tools``
+    is the requested set.
+    """
+
+    def __init__(
+        self,
+        *,
+        engine: Any,
+        allowed: bool,
+        tools: Sequence[str] | None,
+        resources: Sequence[str] | None,
+        intents: Sequence[str] | None,
+        max_depth: int,
+        time_budget_seconds: int,
+        depth: int,
+        max_delegation_depth: int,
+        actor_chain: Sequence[str],
+        violations: Sequence[str] = (),
+        reason: str = "",
+        reason_code: str | None = None,
+    ) -> None:
+        self._engine = engine
+        self.allowed = bool(allowed)
+        self.allowed_tools = _norm(tools)
+        self.allowed_resources = _norm(resources)
+        self.allowed_intents = _norm(intents)
+        self.max_depth = int(max_depth)
+        self.time_budget_seconds = int(time_budget_seconds)
+        self.depth = int(depth)
+        self.max_delegation_depth = min(int(max_delegation_depth), MAX_CHAIN_LENGTH)
+        self.actor_chain: tuple[str, ...] = tuple(actor_chain)
+        self.violations = list(violations)
+        self.reason = reason
+        self.reason_code = reason_code
+
+    def _as_dict(self) -> dict[str, Any]:
+        return {
+            "allowed_tools": self.allowed_tools,
+            "allowed_resources": _matchers(self.allowed_resources),
+            "allowed_intents": self.allowed_intents,
+            "max_depth": self.max_depth,
+            "time_budget_seconds": self.time_budget_seconds,
+            "depth": self.depth,
+        }
+
+    def preview_attenuate(
+        self,
+        *,
+        tools: Sequence[str] | None = None,
+        resources: Sequence[str] | None = None,
+        intents: Sequence[str] | None = None,
+        time_budget_seconds: int | None = None,
+        agent: str | None = None,
+    ) -> "ScopePreview":
+        """Preview the next level down, exactly as :meth:`Scope.attenuate`
+        would decide it. Below a preview that would be refused, nothing would be
+        granted either."""
+        if not self.allowed:
+            return ScopePreview(
+                engine=self._engine,
+                allowed=False,
+                tools=_norm(tools) if tools is not None else self.allowed_tools,
+                resources=(),
+                intents=(),
+                max_depth=0,
+                time_budget_seconds=0,
+                depth=self.depth + 1,
+                max_delegation_depth=self.max_delegation_depth,
+                actor_chain=(*self.actor_chain, agent) if agent else self.actor_chain,
+                violations=self.violations,
+                reason="its parent scope would not be granted",
+                reason_code=self.reason_code,
+            )
+        return _preview_child(
+            self, tools=tools, resources=resources, intents=intents,
+            time_budget_seconds=time_budget_seconds, agent=agent,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """The preview as plain data — for a template or a JSON response."""
+        out: dict[str, Any] = {
+            "allowed": self.allowed,
+            "tools": list(self.allowed_tools),
+            "resources": list(self.allowed_resources),
+            "intents": list(self.allowed_intents),
+            "depth": self.depth,
+            "max_depth": self.max_depth,
+            "time_budget_seconds": self.time_budget_seconds,
+            "actor_chain": list(self.actor_chain),
+        }
+        if not self.allowed:
+            out["violations"] = list(self.violations)
+            out["reason"] = self.reason
+            if self.reason_code:
+                out["reason_code"] = self.reason_code
+        return out
+
+    def __repr__(self) -> str:
+        if not self.allowed:
+            return f"ScopePreview(allowed=False, depth={self.depth}, violations={self.violations})"
+        return f"ScopePreview(depth={self.depth}, tools={self.allowed_tools}, intents={self.allowed_intents})"
+
+
+def _preview_child(
+    parent: Any,
+    *,
+    tools: Sequence[str] | None,
+    resources: Sequence[str] | None,
+    intents: Sequence[str] | None,
+    time_budget_seconds: int | None,
+    agent: str | None,
+) -> ScopePreview:
+    """The :class:`ScopePreview` of a child of ``parent`` — nothing recorded."""
+    out = _attenuation_outcome(
+        parent, tools=tools, resources=resources, intents=intents, time_budget_seconds=time_budget_seconds
+    )
+    chain = (*parent.actor_chain, agent) if agent else tuple(parent.actor_chain)
+    if out["kind"] == "allow":
+        g = out["grant"]
+        return ScopePreview(
+            engine=parent._engine,
+            allowed=True,
+            tools=g["allowed_tools"],
+            resources=g["allowed_resources"],
+            intents=g["allowed_intents"],
+            max_depth=g["max_depth"],
+            time_budget_seconds=g["time_budget_seconds"],
+            depth=g["depth"],
+            max_delegation_depth=parent.max_delegation_depth,
+            actor_chain=chain,
+        )
+    if out["kind"] == "depth":
+        err = DelegationDepthExceeded(out["child_depth"], parent.max_delegation_depth)
+        violations, reason, code = list(err.violations), err.reason, DELEGATION_DEPTH_EXCEEDED
+    else:
+        violations, reason, code = out["violations"], out["reason"], None
+    return ScopePreview(
+        engine=parent._engine,
+        allowed=False,
+        tools=out["requested_tools"],
+        resources=(),
+        intents=(),
+        max_depth=0,
+        time_budget_seconds=0,
+        depth=out["child_depth"],
+        max_delegation_depth=parent.max_delegation_depth,
+        actor_chain=chain,
+        violations=violations,
+        reason=reason,
+        reason_code=code,
+    )

@@ -97,6 +97,7 @@ from .attenuation import (
     AttenuationDenied,
     DelegationDepthExceeded,
     Scope,
+    ScopePreview,
 )
 from .scope_token import MAX_CHAIN_LENGTH as _DEPTH_BOUND
 from .policytest import load_test_suite, run_policy_tests
@@ -181,6 +182,7 @@ __all__ = [
     "ScreenError",
     "govern",
     "Scope",
+    "ScopePreview",
     "AttenuationDenied",
     "DelegationDepthExceeded",
     "ScopeTokenError",
@@ -2469,7 +2471,8 @@ class Watchlight:
         """
         _assert_agent_name(agent, "delegate(parent, agent)")
         scope = parent.delegated_scope if isinstance(parent, Watchlight) else parent
-        if scope is None:
+        # A ScopePreview is data, never authority: only a real scope can delegate.
+        if not isinstance(scope, Scope):
             raise TypeError(
                 "delegate(parent, agent): `parent` must be a scope, or a governor that "
                 "was itself delegated"
@@ -2712,15 +2715,7 @@ class Watchlight:
         it. A hop past the limit raises :class:`DelegationDepthExceeded`. See
         :class:`~watchlight.attenuation.Scope`.
         """
-        limit = self._shared.max_delegation_depth
-        if max_depth is None:
-            budget = limit
-        else:
-            if isinstance(max_depth, bool) or not isinstance(max_depth, int):
-                raise TypeError("max_depth must be an int")
-            if max_depth < 0:
-                raise ValueError("max_depth must not be negative")
-            budget = min(max_depth, limit)
+        budget = self._root_budget(max_depth)
         root = Scope(
             engine=self._engine,
             audit_path=self._audit_path,
@@ -2737,6 +2732,47 @@ class Watchlight:
         )
         root._emit_root()  # record the tree's starting authority for `watchlight dev`
         return root
+
+    def preview_scope(
+        self,
+        *,
+        tools: Sequence[str] | None = None,
+        resources: Sequence[str] | None = None,
+        intents: Sequence[str] | None = None,
+        max_depth: Optional[int] = None,
+        time_budget_seconds: int = 3600,
+    ) -> ScopePreview:
+        """What :meth:`scope` would grant, without granting it or recording
+        anything — for a page that shows an agent's authority. Call
+        :meth:`~watchlight.attenuation.ScopePreview.preview_attenuate` on the
+        result to preview each sub-agent's scope, decided by the same engine
+        check as :meth:`~watchlight.attenuation.Scope.attenuate`. A preview is
+        data, never a scope: it cannot authorize, delegate, or mint a token."""
+        budget = self._root_budget(max_depth)
+        return ScopePreview(
+            engine=self._engine,
+            allowed=True,
+            tools=tools,
+            resources=resources,
+            intents=intents,
+            max_depth=budget,
+            time_budget_seconds=time_budget_seconds,
+            depth=0,
+            max_delegation_depth=budget,
+            actor_chain=(self.agent,),
+        )
+
+    def _root_budget(self, max_depth: Optional[int]) -> int:
+        """A root scope's depth budget: the governor's limit, lowered (never
+        raised) by ``max_depth``."""
+        limit = self._shared.max_delegation_depth
+        if max_depth is None:
+            return limit
+        if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+            raise TypeError("max_depth must be an int")
+        if max_depth < 0:
+            raise ValueError("max_depth must not be negative")
+        return min(max_depth, limit)
 
     def scope_from_token(self, token: str) -> Scope:
         """Re-establish a scope minted by
@@ -3549,6 +3585,7 @@ class Watchlight:
             # has already resolved it (to the typed Agent::"<name>" by default).
             "principal": self._principal(principal),
             "intent": intent,
+            "event": "decision",
             "resource": resource,
             "decision": decision,
         }

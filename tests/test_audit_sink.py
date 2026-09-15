@@ -73,8 +73,8 @@ def test_every_record_kind_reaches_the_sink_with_identical_fields(tmp_path):
     _exercise(g)
     file = _lines(tmp_path)
     assert seen == file, "sink must see every file line, same order, same fields"
-    assert any("event" not in r and r["decision"] == "Allow" for r in seen)
-    assert any("event" not in r and r["decision"] == "Deny" for r in seen)
+    assert any(r.get("event") == "decision" and r["decision"] == "Allow" for r in seen)
+    assert any(r.get("event") == "decision" and r["decision"] == "Deny" for r in seen)
     assert any(r["decision"] == "NeedsApproval" for r in seen)
     assert any(r.get("approved") is True and r["decision"] == "Allow" for r in seen)
     assert any(r.get("event") == "sanitization" and r["counts"]["EMAIL"] == 1 for r in seen)
